@@ -45,3 +45,26 @@ class DeviceLog(models.Model):
     class Meta:
         db_table = 'device_logs'
         ordering = ['-created_at']
+
+class DeviceStatistics(models.Model):
+    device = models.ForeignKey(Device, on_delete=models.CASCADE, related_name='statistics')
+    date = models.DateField()  # Ngày thống kê
+    turn_on_count = models.IntegerField(default=0)
+    total_usage_minutes = models.IntegerField(default=0)  # Tổng thời gian sử dụng (phút)
+    power_consumption = models.FloatField(default=0.0)  # kWh
+    cost = models.FloatField(default=0.0)  # Chi phí
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'device_statistics'
+        unique_together = ['device', 'date']
+
+class DeviceUsageSession(models.Model):
+    device = models.ForeignKey(Device, on_delete=models.CASCADE, related_name='usage_sessions')
+    start_time = models.DateTimeField()
+    end_time = models.DateTimeField(null=True, blank=True)
+    duration_minutes = models.IntegerField(default=0)  # Thời gian sử dụng (phút)
+    
+    class Meta:
+        db_table = 'device_usage_sessions'
