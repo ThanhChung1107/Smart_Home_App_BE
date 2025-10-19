@@ -43,6 +43,7 @@ INSTALLED_APPS = [
     'users',
     'devices',
     'testapp',
+    'schedules',
 ]
 
 AUTH_USER_MODEL = 'users.User'
@@ -117,7 +118,7 @@ AUTH_PASSWORD_VALIDATORS = [
 
 LANGUAGE_CODE = 'en-us'
 
-TIME_ZONE = 'UTC'
+TIME_ZONE = 'Asia/Ho_Chi_Minh'  # Nếu ở Việt Nam
 
 USE_I18N = True
 

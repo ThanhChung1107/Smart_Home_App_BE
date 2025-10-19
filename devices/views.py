@@ -4,9 +4,125 @@ from django.views.decorators.http import require_http_methods
 from django.utils.decorators import method_decorator
 from django.views import View
 import json
-from django.db.models import Sum
+from django.db.models import Sum, Avg, Count
+from django.utils import timezone
+from datetime import timedelta, datetime
 from .models import Device, DeviceLog, DeviceStatistics, DeviceUsageSession 
 
+# Helper functions
+def _get_power_rate(device_type):
+    """Lấy công suất thiết bị (kW)"""
+    power_rates = {
+        'light': 0.015,    # 15W = 0.015kW
+        'fan': 0.05,       # 50W = 0.05kW
+        'ac': 1.2,         # 1200W = 1.2kW
+        'socket': 0.1,     # 100W = 0.1kW
+        'door': 0.005,     # 5W = 0.005kW
+    }
+    return power_rates.get(device_type, 0.1)
+
+def _update_device_statistics(device, action, old_is_on):
+    """Cập nhật thống kê khi thay đổi trạng thái thiếtết bị"""
+    print(f"🔧 Updating stats: device={device.name}, action={action}, old_is_on={old_is_on}, new_is_on={not old_is_on if action == 'toggle' else action == 'on'}")
+    
+    # Tính trạng thái mới thực tế
+    if action == 'toggle':
+        new_is_on = not old_is_on
+    elif action == 'on':
+        new_is_on = True
+    elif action == 'off':
+        new_is_on = False
+    else:
+        new_is_on = old_is_on
+
+    # Bật thiết bị - TẠO SESSION MỚI
+    if new_is_on and not old_is_on:
+        print(f"🚀 Starting NEW session for {device.name}")
+        # Đảm bảo kết thúc session cũ nếu có (phòng trường hợp)
+        old_sessions = DeviceUsageSession.objects.filter(
+            device=device, 
+            end_time__isnull=True
+        )
+        if old_sessions.exists():
+            print(f"⚠️  Found {old_sessions.count()} old active sessions, ending them")
+            for old_session in old_sessions:
+                old_session.end_time = timezone.now()
+                old_session.duration_minutes = round((session.end_time - session.start_time).total_seconds() / 60)
+                old_session.save()
+        
+        # Tạo session mới
+        DeviceUsageSession.objects.create(device=device, start_time=timezone.now())
+        
+        # Cập nhật số lần bật
+        today = timezone.localtime(timezone.now()).date()
+        stats, created = DeviceStatistics.objects.get_or_create(
+            device=device, 
+            date=today,
+            defaults={
+                'turn_on_count': 1,
+                'total_usage_minutes': 0,
+                'power_consumption': 0.0,
+                'cost': 0.0
+            }
+        )
+        if not created:
+            stats.turn_on_count += 1
+            stats.save()
+        print(f"✅ Session started. Turn on count: {stats.turn_on_count}")
+    
+    # Tắt thiết bị - KẾT THÚC SESSION
+    elif not new_is_on and old_is_on:
+        print(f"🛑 Ending session for {device.name}")
+        # Tìm session đang chạy
+        session = DeviceUsageSession.objects.filter(
+            device=device, 
+            end_time__isnull=True
+        ).order_by('-start_time').first()
+        
+        if session:
+            session.end_time = timezone.now()
+            duration = session.end_time - session.start_time
+            duration_minutes = int(duration.total_seconds() / 60)
+            duration_seconds = int(duration.total_seconds())
+            session.duration_minutes = duration_minutes
+            session.save()
+
+            print(f"⏱️ Session duration: {duration_seconds} seconds ({duration_minutes} minutes)")
+            
+            # Cập nhật thống kê
+            if duration_minutes > 0:
+                power_rate = _get_power_rate(device.device_type)
+                hours_used = duration_minutes / 60.0
+                power_consumed = power_rate * hours_used
+                cost = power_consumed * 2500  # 2500 VND/kWh
+
+                today = timezone.localtime(timezone.now()).date()
+                stats, created = DeviceStatistics.objects.get_or_create(
+                    device=device,
+                    date=today,
+                    defaults={
+                        'turn_on_count': 0,
+                        'total_usage_minutes': duration_minutes,
+                        'power_consumption': power_consumed,
+                        'cost': cost
+                    }
+                )
+                if not created:
+                    stats.total_usage_minutes += duration_minutes
+                    stats.power_consumption += power_consumed
+                    stats.cost += cost
+                    stats.save()
+                
+                print(f"✅ Stats updated: +{duration_minutes}min, total: {stats.total_usage_minutes}min, cost: {cost} VND")
+            else:
+                print("⏩ Session too short (< 1 min), skipping stats update")
+        else:
+            print("❌ No active session found to end")
+    
+    else:
+        print(f"ℹ️  No state change needed: {device.name}")
+
+# Views
 @method_decorator(csrf_exempt, name='dispatch')
 class DeviceListView(View):
     def get(self, request):
@@ -47,6 +163,10 @@ class DeviceControlView(View):
             old_status = device.status.copy()
             old_is_on = device.is_on
             
+            # Cập nhật thống kê TRƯỚC KHI thay đổi trạng thái
+            _update_device_statistics(device, action, old_is_on)
+            
+            # Cập nhật trạng thái thiết bị
             if action == 'toggle':
                 device.is_on = not device.is_on
             elif action == 'on':
@@ -127,10 +247,8 @@ class DeviceLogsView(View):
         except Device.DoesNotExist:
             return JsonResponse({'success': False, 'message': 'Thiết bị không tồn tại'}, status=404)
 
-
-from django.utils import timezone
-from datetime import timedelta, datetime
-import json
+# XÓA các view trùng lặp: DeviceUsageStartView, DeviceUsageEndView, và function toggle_device
+# Vì logic đã được tích hợp vào DeviceControlView thông qua _update_device_statistics
 
 @method_decorator(csrf_exempt, name='dispatch')
 class RealStatisticsView(View):
@@ -141,16 +259,16 @@ class RealStatisticsView(View):
             
             # Xác định khoảng thời gian
             if period == 'today':
-                start_date = timezone.now().date()
+                start_date = timezone.localtime(timezone.now()).date()
                 end_date = start_date
             elif period == 'week':
-                start_date = timezone.now().date() - timedelta(days=7)
-                end_date = timezone.now().date()
+                start_date = timezone.localtime(timezone.now()).date() - timedelta(days=7)
+                end_date = timezone.localtime(timezone.now()).date()
             elif period == 'month':
-                start_date = timezone.now().date() - timedelta(days=30)
-                end_date = timezone.now().date()
+                start_date = timezone.localtime(timezone.now()).date() - timedelta(days=30)
+                end_date = timezone.localtime(timezone.now()).date()
             else:
-                start_date = timezone.now().date()
+                start_date = timezone.localtime(timezone.now()).date()
                 end_date = start_date
 
             devices = Device.objects.all()
@@ -210,16 +328,13 @@ class RealStatisticsView(View):
 
         except Exception as e:
             return JsonResponse({'success': False, 'message': str(e)})
-# Thêm vào views.py
-from django.db.models import Sum, Avg, Count
-from datetime import datetime, timedelta
 
 @method_decorator(csrf_exempt, name='dispatch')
 class DeviceStatisticsView(View):
     """API lấy thống kê chi tiết theo thiết bị"""
     def get(self, request, device_id):
         try:
-            period = request.GET.get('period', 'today')  # today, week, month, year
+            period = request.GET.get('period', 'today')
             device = Device.objects.get(id=device_id)
             
             # Xác định khoảng thời gian
@@ -297,8 +412,8 @@ class DeviceStatisticsView(View):
                 },
                 'daily_data': daily_data,
                 'recent_sessions': sessions_data,
-                'power_rate': _get_power_rate(device.device_type),  # kW
-                'electricity_price': 2500,  # VND/kWh
+                'power_rate': _get_power_rate(device.device_type),
+                'electricity_price': 2500,
             })
 
         except Device.DoesNotExist:
@@ -431,8 +546,9 @@ class RealTimeUsageView(View):
                 ).first()
                 
                 if active_session:
-                    usage_duration = timezone.now() - active_session.start_time
-                    usage_minutes = int(usage_duration.total_seconds() / 60)
+                    now = timezone.now()  # Giữ consistent
+                    usage_duration = now - active_session.start_time
+                    usage_minutes = round(usage_duration.total_seconds() / 60)
                     power_rate = _get_power_rate(device.device_type)
                     estimated_cost = (power_rate * (usage_minutes / 60)) * 2500
                     
@@ -475,101 +591,91 @@ class RealTimeUsageView(View):
         except Exception as e:
             return JsonResponse({'success': False, 'message': str(e)})
 @method_decorator(csrf_exempt, name='dispatch')
-class DeviceUsageStartView(View):
-    """Bắt đầu session sử dụng device"""
-    def post(self, request, device_id):
+class DebugStatsView(View):
+    def get(self, request):
+        """API debug để kiểm tra chi tiết sessions và statistics"""
         try:
-            data = json.loads(request.body)
-            device = Device.objects.get(id=device_id)
+            from django.utils import timezone
+            from datetime import datetime, timedelta
             
-            # Tạo session mới
-            session = DeviceUsageSession.objects.create(
-                device=device,
-                start_time=timezone.now()
-            )
+            debug_data = {}
             
-            # Cập nhật thống kê ngày hiện tại
-            today = timezone.now().date()
-            stats, created = DeviceStatistics.objects.get_or_create(
-                device=device,
-                date=today,
-                defaults={
-                    'turn_on_count': 1,
-                    'total_usage_minutes': 0,
-                    'power_consumption': 0.0,
-                    'cost': 0.0
-                }
-            )
+            # 1. Kiểm tra sessions hôm nay
+            today = timezone.localtime(timezone.now()).date()
+            sessions_today = DeviceUsageSession.objects.filter(
+                start_time__date=today
+            ).order_by('-start_time')
             
-            if not created:
-                stats.turn_on_count += 1
-                stats.save()
+            debug_data['sessions_today'] = []
+            for session in sessions_today:
+                duration = None
+                if session.end_time:
+                    duration = int((session.end_time - session.start_time).total_seconds() / 60)  # phút
+                
+                debug_data['sessions_today'].append({
+                    'device': session.device.name,
+                    'start_time': session.start_time.strftime('%H:%M:%S'),
+                    'end_time': session.end_time.strftime('%H:%M:%S') if session.end_time else 'Đang chạy',
+                    'duration_minutes': duration,
+                    'duration_minutes_field': session.duration_minutes,
+                })
+            
+            # 2. Kiểm tra statistics hôm nay
+            stats_today = DeviceStatistics.objects.filter(date=today)
+            
+            debug_data['statistics_today'] = []
+            for stat in stats_today:
+                debug_data['statistics_today'].append({
+                    'device': stat.device.name,
+                    'turn_on_count': stat.turn_on_count,
+                    'total_usage_minutes': stat.total_usage_minutes,
+                    'total_usage_hours': round(stat.total_usage_minutes / 60, 2),
+                    'power_consumption': stat.power_consumption,
+                    'cost': stat.cost,
+                })
+            
+            # 3. Kiểm tra sessions đang chạy
+            active_sessions = DeviceUsageSession.objects.filter(end_time__isnull=True)
+            
+            debug_data['active_sessions'] = []
+            for session in active_sessions:
+                current_duration = int((timezone.now() - session.start_time).total_seconds() / 60)
+                debug_data['active_sessions'].append({
+                    'device': session.device.name,
+                    'start_time': session.start_time.strftime('%H:%M:%S'),
+                    'current_duration_minutes': current_duration,
+                })
             
             return JsonResponse({
                 'success': True,
-                'session_id': session.id,
-                'message': 'Bắt đầu theo dõi sử dụng'
+                'debug_data': debug_data,
+                'timestamp': timezone.now().strftime('%H:%M:%S')
             })
             
         except Exception as e:
             return JsonResponse({'success': False, 'message': str(e)})
-
+        
 @method_decorator(csrf_exempt, name='dispatch')
-class DeviceUsageEndView(View):
-    """Kết thúc session sử dụng device"""
-    def post(self, request, session_id):
+class CleanupSessionsView(View):
+    def post(self, request):
+        """Dọn dẹp các sessions đang chạy"""
         try:
-            session = DeviceUsageSession.objects.get(id=session_id)
-            session.end_time = timezone.now()
+            active_sessions = DeviceUsageSession.objects.filter(end_time__isnull=True)
+            count = active_sessions.count()
             
-            # Tính thời gian sử dụng
-            duration = session.end_time - session.start_time
-            duration_minutes = int(duration.total_seconds() / 60)
-            session.duration_minutes = duration_minutes
-            session.save()
-            
-            # Cập nhật thống kê
-            today = timezone.now().date()
-            stats, created = DeviceStatistics.objects.get_or_create(
-                device=session.device,
-                date=today,
-                defaults={
-                    'turn_on_count': 0,
-                    'total_usage_minutes': duration_minutes,
-                    'power_consumption': 0.0,
-                    'cost': 0.0
-                }
-            )
-            
-            if not created:
-                stats.total_usage_minutes += duration_minutes
+            for session in active_sessions:
+                session.end_time = timezone.now()
+                duration = session.end_time - session.start_time
+                session.duration_minutes = int(duration.total_seconds() / 60)
+                session.save()
                 
-                # Tính điện năng tiêu thụ và chi phí
-                power_rate = _get_power_rate(session.device.device_type)
-                hours_used = duration_minutes / 60.0
-                power_consumed = power_rate * hours_used
-                cost = power_consumed * 2500  # 2500 VND/kWh
-                
-                stats.power_consumption += power_consumed
-                stats.cost += cost
-                stats.save()
+                print(f"🧹 Cleaned session: {session.device.name}, duration: {session.duration_minutes}min")
             
             return JsonResponse({
                 'success': True,
-                'duration_minutes': duration_minutes,
-                'message': 'Kết thúc session sử dụng'
+                'message': f'Đã dọn dẹp {count} sessions đang chạy',
+                'cleaned_sessions': count
             })
             
         except Exception as e:
             return JsonResponse({'success': False, 'message': str(e)})
-
-def _get_power_rate(device_type):
-    """Lấy công suất thiết bị (kW)"""
-    power_rates = {
-        'light': 0.015,    # 15W = 0.015kW
-        'fan': 0.05,       # 50W = 0.05kW
-        'ac': 1.2,         # 1200W = 1.2kW
-        'socket': 0.1,     # 100W = 0.1kW
-        'door': 0.005,     # 5W = 0.005kW
-    }
-    return power_rates.get(device_type, 0.1)
