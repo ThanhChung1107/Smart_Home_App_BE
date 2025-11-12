@@ -1,6 +1,7 @@
+# models.py
 from django.db import models
 import uuid
-from users.models import User   # để liên kết với User
+from users.models import User
 
 class Device(models.Model):
     DEVICE_TYPES = (
@@ -9,6 +10,8 @@ class Device(models.Model):
         ('ac', 'Điều hòa'),
         ('socket', 'Ổ cắm'),
         ('door', 'Cửa'),
+        ('sensor', 'Cảm biến'),
+        ('dryer', 'Máy sấy'),
     )
 
     ROOM_CHOICES = (
@@ -17,22 +20,29 @@ class Device(models.Model):
         ('kitchen', 'Nhà bếp'),
         ('bathroom', 'Phòng tắm'),
         ('outside', 'Bên ngoài'),
+        ('corridor', 'Hành lang'),
     )
 
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    id = models.CharField(max_length=100, primary_key=True)
     name = models.CharField(max_length=100)
+    device_code = models.CharField(max_length=20, unique=True, blank=True, null=True)  # Mã thiết bị trong code phần cứng
     device_type = models.CharField(max_length=20, choices=DEVICE_TYPES)
     room = models.CharField(max_length=20, choices=ROOM_CHOICES)
     is_on = models.BooleanField(default=False)
     status = models.JSONField(default=dict)
     ip_address = models.GenericIPAddressField(blank=True, null=True)
+    is_online = models.BooleanField(default=False)
+    description = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         db_table = 'devices'
+        
+    def __str__(self):
+        return f"{self.name} ({self.device_code})"
 
-
+# Các model khác giữ nguyên...
 class DeviceLog(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     device = models.ForeignKey(Device, on_delete=models.CASCADE, related_name='logs')
@@ -48,11 +58,11 @@ class DeviceLog(models.Model):
 
 class DeviceStatistics(models.Model):
     device = models.ForeignKey(Device, on_delete=models.CASCADE, related_name='statistics')
-    date = models.DateField()  # Ngày thống kê
+    date = models.DateField()
     turn_on_count = models.IntegerField(default=0)
-    total_usage_minutes = models.IntegerField(default=0)  # Tổng thời gian sử dụng (phút)
-    power_consumption = models.FloatField(default=0.0)  # kWh
-    cost = models.FloatField(default=0.0)  # Chi phí
+    total_usage_minutes = models.IntegerField(default=0)
+    power_consumption = models.FloatField(default=0.0)
+    cost = models.FloatField(default=0.0)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -64,7 +74,7 @@ class DeviceUsageSession(models.Model):
     device = models.ForeignKey(Device, on_delete=models.CASCADE, related_name='usage_sessions')
     start_time = models.DateTimeField()
     end_time = models.DateTimeField(null=True, blank=True)
-    duration_minutes = models.IntegerField(default=0)  # Thời gian sử dụng (phút)
+    duration_minutes = models.IntegerField(default=0)
     
     class Meta:
         db_table = 'device_usage_sessions'

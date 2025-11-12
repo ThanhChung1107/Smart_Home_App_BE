@@ -148,7 +148,6 @@ class DeviceListView(View):
             'success': True,
             'devices': devices_data
         })
-
 @method_decorator(csrf_exempt, name='dispatch')
 class DeviceControlView(View):
     def post(self, request, device_id):
