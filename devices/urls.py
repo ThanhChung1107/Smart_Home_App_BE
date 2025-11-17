@@ -11,4 +11,6 @@ urlpatterns = [
     path('api/statistics/', views.RealStatisticsView.as_view(), name='real_statistics'),
     path('api/debug/stats/', views.DebugStatsView.as_view(), name='debug_stats'),
     path('api/cleanup-sessions/', views.CleanupSessionsView.as_view(), name='cleanup_sessions'),
+    path('api/schedules/', views.ScheduleListView.as_view(), name='schedule_list_create'),
+    path('api/schedules/<uuid:schedule_id>/', views.ScheduleDetailView.as_view(), name='schedule_detail_update_delete'),
 ]

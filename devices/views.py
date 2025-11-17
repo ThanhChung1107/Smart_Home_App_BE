@@ -678,3 +678,149 @@ class CleanupSessionsView(View):
             
         except Exception as e:
             return JsonResponse({'success': False, 'message': str(e)})
+        
+# devices/views.py
+# ... (imports đã có)
+from .models import Device, DeviceLog, DeviceStatistics, DeviceUsageSession, DeviceSchedule # Thêm DeviceSchedule
+from django.utils import timezone
+
+# ... (Các views DeviceListView, DeviceControlView, v.v. giữ nguyên)
+
+@method_decorator(csrf_exempt, name='dispatch')
+class ScheduleListView(View):
+    """
+    API để LẤY DANH SÁCH và TẠO MỚI lịch hẹn.
+    """
+    def get(self, request):
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Chưa đăng nhập'}, status=401)
+        
+        # Lấy các lịch hẹn chưa thực thi của user
+        schedules = DeviceSchedule.objects.filter(
+            user=request.user, 
+            is_active=True
+        ).order_by('scheduled_time')
+        
+        data = []
+        for schedule in schedules:
+            data.append({
+                'id': str(schedule.id),
+                'device_id': str(schedule.device.id),
+                'device_name': schedule.device.name,
+                'action': schedule.action,
+                'scheduled_time': schedule.scheduled_time.isoformat(),
+                'is_executed': schedule.is_executed,
+            })
+        return JsonResponse({'success': True, 'schedules': data})
+
+    def post(self, request):
+        if not request.user.is_authenticated:
+            return JsonResponse({
+                'success': False, 
+                'message': 'Chưa đăng nhập'
+            }, status=401)
+        
+        try:
+            data = json.loads(request.body)
+            print(f"📝 Received schedule data: {data}")  # DEBUG
+            
+            # Validate required fields
+            required_fields = ['device_id', 'action', 'scheduled_time']
+            for field in required_fields:
+                if field not in data:
+                    return JsonResponse({
+                        'success': False,
+                        'message': f'Thiếu trường {field}'
+                    }, status=400)
+            
+            # Get device
+            try:
+                device = Device.objects.get(id=data['device_id'])
+            except Device.DoesNotExist:
+                return JsonResponse({
+                    'success': False,
+                    'message': 'Thiết bị không tồn tại'
+                }, status=404)
+            
+            # Parse scheduled_time - DEBUG CHI TIẾT
+            scheduled_time_str = data['scheduled_time']
+            print(f"🕒 Parsing time string: '{scheduled_time_str}'")  # DEBUG
+            
+            from datetime import datetime
+            try:
+                scheduled_time = datetime.strptime(scheduled_time_str, '%H:%M').time()
+                print(f"✅ Successfully parsed time: {scheduled_time}")  # DEBUG
+            except ValueError as e:
+                print(f"❌ Time parsing error: {e}")  # DEBUG
+                return JsonResponse({
+                    'success': False,
+                    'message': f'Định dạng thời gian không hợp lệ: {scheduled_time_str}. Lỗi: {str(e)}'
+                }, status=400)
+            
+            # Parse scheduled_date if provided
+            scheduled_date = None
+            if data.get('scheduled_date'):
+                date_str = data['scheduled_date']
+                print(f"📅 Parsing date string: '{date_str}'")  # DEBUG
+                try:
+                    scheduled_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+                    print(f"✅ Successfully parsed date: {scheduled_date}")  # DEBUG
+                except ValueError as e:
+                    print(f"❌ Date parsing error: {e}")  # DEBUG
+                    return JsonResponse({
+                        'success': False,
+                        'message': f'Định dạng ngày không hợp lệ: {date_str}'
+                    }, status=400)
+            
+            # Create schedule
+            schedule = DeviceSchedule.objects.create(
+                user=request.user,
+                device=device,
+                action=data['action'],
+                scheduled_time=scheduled_time,
+                scheduled_date=scheduled_date,
+                repeat_type=data.get('repeat_type', 'once'),
+                repeat_days=data.get('repeat_days', []),
+                is_active=data.get('is_active', True)
+            )
+            
+            print(f"✅ Schedule created: {schedule.id}")  # DEBUG
+            
+            return JsonResponse({
+                'success': True,
+                'message': 'Đã tạo lịch trình thành công',
+                'schedule_id': str(schedule.id)
+            }, status=201)
+            
+        except Exception as e:
+            print(f"❌ General error: {e}")  # DEBUG
+            import traceback
+            print(f"❌ Traceback: {traceback.format_exc()}")  # DEBUG
+            return JsonResponse({
+                'success': False,
+                'message': f'Lỗi: {str(e)}'
+            }, status=400)
+    
+@method_decorator(csrf_exempt, name='dispatch')
+class ScheduleDetailView(View):
+    """
+    API để XÓA hoặc SỬA (bật/tắt) một lịch hẹn.
+    """
+    def delete(self, request, schedule_id):
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Chưa đăng nhập'}, status=401)
+        
+        try:
+            schedule = DeviceSchedule.objects.get(id=schedule_id, user=request.user)
+            schedule.delete()
+            return JsonResponse({'success': True, 'message': 'Đã xóa lịch hẹn'})
+            
+        except DeviceSchedule.DoesNotExist:
+            return JsonResponse({'success': False, 'message': 'Lịch hẹn không tồn tại'}, status=404)
+        except Exception as e:
+            return JsonResponse({'success': False, 'message': f'Lỗi: {str(e)}'}, status=400)
+            
+    # Bạn có thể thêm hàm `put` để cập nhật (ví dụ: thay đổi thời gian, hoặc bật/tắt is_active)
+    def put(self, request, schedule_id):
+        # ... Tương tự, lấy data và cập nhật schedule.save() ...
+        pass

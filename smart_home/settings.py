@@ -48,7 +48,7 @@ INSTALLED_APPS = [
     'corsheaders',
     'users',
     'devices',
-    'testapp',
+    'channels',
     'django_celery_beat',
 ]
 
@@ -83,6 +83,16 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'smart_home.wsgi.application'
+ASGI_APPLICATION = "smart_home.asgi.application"
+
+CHANNEL_LAYERS = {
+    "default": {
+        "BACKEND": "channels_redis.core.RedisChannelLayer",
+        "CONFIG": {
+            "hosts": [("127.0.0.1", 6379)],
+        },
+    },
+}
 
 
 # Database
@@ -91,7 +101,7 @@ WSGI_APPLICATION = 'smart_home.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
-        'NAME':  'smart_home',
+        'NAME':  'smart_home_db',
         'USER': 'root',
         'PASSWORD':'root',
         'HOST': 'localhost',
@@ -176,3 +186,14 @@ MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
 ALLOWED_HOSTS = ['*']
+
+
+# Sửa Celery configuration
+CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
+CELERY_RESULT_SERIALIZER = 'json'
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_SERIALIZER = 'json'
+
+# Quan trọng: Thêm các setting này
+CELERY_RESULT_ACCEPT_CONTENT = ['json']
+CELERY_TASK_IGNORE_RESULT = False  # Đảm bảo lưu result
