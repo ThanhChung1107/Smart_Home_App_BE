@@ -1,14 +1,15 @@
 from django.core.management.base import BaseCommand
 from django.utils import timezone
-from devices.models import DeviceSchedule, DeviceLog
+from devices.models import DeviceSchedule, DeviceLog, Device
 import time
 import logging
+import requests
 from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
 class Command(BaseCommand):
-    help = 'Run custom device scheduler without Celery'
+    help = 'Run custom device scheduler with real ESP8266 control'
     
     def add_arguments(self, parser):
         parser.add_argument(
@@ -21,7 +22,7 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         interval = options['interval']
         self.stdout.write(
-            self.style.SUCCESS(f'🚀 Starting Device Scheduler (checking every {interval}s)...')
+            self.style.SUCCESS(f'🚀 Starting Device Scheduler with ESP8266 Control (checking every {interval}s)...')
         )
         
         try:
@@ -37,18 +38,14 @@ class Command(BaseCommand):
     
     def check_and_execute_schedules(self):
         """Kiểm tra và thực thi schedules"""
-        
-        # ✅ LẤY THỜI GIAN HIỆN TẠI (aware datetime)
         now = timezone.now()
-        
-        # ✅ Convert sang local timezone để hiển thị
         now_local = timezone.localtime(now)
         
         self.stdout.write(
             f'🕐 Current time: {now_local.strftime("%Y-%m-%d %H:%M:%S %z")}'
         )
         
-        # Tìm schedules chưa executed, active
+        # Tìm schedules active, chưa executed
         pending_schedules = DeviceSchedule.objects.filter(
             is_active=True,
             is_executed=False
@@ -61,28 +58,20 @@ class Command(BaseCommand):
         schedules_to_execute = []
         
         for schedule in pending_schedules:
-            # ✅ TẠO SCHEDULED_DATETIME (naive)
             if schedule.scheduled_date:
-                # Có ngày cụ thể
                 scheduled_naive = datetime.combine(
                     schedule.scheduled_date, 
                     schedule.scheduled_time
                 )
             else:
-                # Không có ngày - dùng ngày hôm nay (local date)
                 scheduled_naive = datetime.combine(
                     now_local.date(), 
                     schedule.scheduled_time
                 )
             
-            # ✅ QUAN TRỌNG: Chuyển naive datetime thành aware datetime
-            # Assume naive datetime là theo timezone của project (settings.TIME_ZONE)
             scheduled_aware = timezone.make_aware(scheduled_naive)
-            
-            # Convert sang local để hiển thị
             scheduled_local = timezone.localtime(scheduled_aware)
             
-            # DEBUG: In thông tin
             self.stdout.write(
                 f'📅 {schedule.device.name} ({schedule.device.device_type.upper()})'
             )
@@ -93,17 +82,15 @@ class Command(BaseCommand):
                 f'   🕐 Current:   {now_local.strftime("%Y-%m-%d %H:%M:%S %z")}'
             )
             
-            # ✅ So sánh (cả 2 đều là aware datetime)
             time_diff = (now - scheduled_aware).total_seconds()
             
-            if time_diff >= 0:  # Đã đến hoặc qua giờ
+            if time_diff >= 0:
                 if time_diff > 300:  # Quá 5 phút
                     self.stdout.write(
                         self.style.WARNING(
                             f'   ⚠️  Too late (delayed {time_diff/60:.1f} minutes) - Skipping'
                         )
                     )
-                    # Đánh dấu executed nhưng không thực thi
                     schedule.is_executed = True
                     schedule.save()
                 else:
@@ -130,14 +117,24 @@ class Command(BaseCommand):
             self.stdout.write('⏰ No schedules ready for execution')
     
     def execute_schedule(self, schedule):
-        """Thực thi một schedule"""
+        """Thực thi schedule - GỬI LỆNH ĐẾN ESP8266"""
         try:
             device = schedule.device
             old_state = device.is_on
             
             self.stdout.write(f'⚡ Executing: {device.name} -> {schedule.action}')
             
-            # Thực hiện hành động
+            # ✅ BƯỚC 1: GỬI LỆNH ĐẾN ESP8266 TRƯỚC
+            esp_success = self._send_to_esp8266(device, schedule.action)
+            
+            if not esp_success:
+                self.stdout.write(
+                    self.style.ERROR(f'❌ Failed to send command to ESP8266')
+                )
+                # Có thể chọn: return để không cập nhật DB, hoặc vẫn cập nhật
+                # return  # Uncomment nếu muốn bỏ qua khi ESP8266 lỗi
+            
+            # ✅ BƯỚC 2: Cập nhật database
             if schedule.action == 'on':
                 device.is_on = True
                 action_text = "BẬT"
@@ -156,15 +153,14 @@ class Command(BaseCommand):
             
             device.status['last_scheduled_action'] = schedule.action
             device.status['last_scheduled_time'] = timezone.now().isoformat()
-            
             device.save()
             
-            # ✅ QUAN TRỌNG: Đánh dấu đã executed
+            # ✅ BƯỚC 3: Đánh dấu schedule đã executed
             schedule.is_executed = True
             schedule.executed_at = timezone.now()
             schedule.save()
             
-            # Ghi log
+            # ✅ BƯỚC 4: Ghi log
             try:
                 DeviceLog.objects.create(
                     device=device,
@@ -181,11 +177,12 @@ class Command(BaseCommand):
             self.stdout.write(
                 self.style.SUCCESS(
                     f'✅ {action_text} {device.name} ({device.device_type.upper()}) | '
-                    f'Trạng thái: {old_state} → {device.is_on}'
+                    f'ESP8266: {"✅" if esp_success else "❌"} | '
+                    f'DB: {old_state} → {device.is_on}'
                 )
             )
             
-            # Gửi realtime update
+            # ✅ BƯỚC 5: Gửi realtime update
             self.send_realtime_update(device)
             
         except Exception as e:
@@ -194,12 +191,153 @@ class Command(BaseCommand):
             )
             logger.error(f'Schedule execution error: {e}', exc_info=True)
             
-            # Đánh dấu executed để không retry liên tục
             try:
                 schedule.is_executed = True
                 schedule.save()
             except:
                 pass
+    
+    def _send_to_esp8266(self, device, action):
+        """
+        🔥 QUAN TRỌNG: Gửi lệnh điều khiển đến ESP8266
+        """
+        try:
+            if not device.ip_address:
+                self.stdout.write(
+                    self.style.WARNING(f'⚠️ Device {device.name} không có IP address')
+                )
+                return False
+            
+            self.stdout.write(f'📡 Sending to ESP8266: {device.ip_address}')
+            
+            # Mapping device types
+            device_type = device.device_type.lower()
+            
+            if device_type in ['light', 'led']:
+                return self._control_light(device, action)
+            elif device_type == 'fan':
+                return self._control_fan(device, action)
+            elif device_type == 'door':
+                return self._control_door(device, action)
+            elif device_type == 'dryer':
+                return self._control_dryer(device, action)
+            else:
+                self.stdout.write(
+                    self.style.WARNING(f'⚠️ Device type {device_type} chưa hỗ trợ')
+                )
+                return True  # Vẫn cho phép cập nhật DB
+            
+        except Exception as e:
+            self.stdout.write(
+                self.style.ERROR(f'❌ ESP8266 error: {e}')
+            )
+            return False
+    
+    def _control_light(self, device, action):
+        """Điều khiển đèn LED"""
+        try:
+            # Xác định LED number
+            led_number = self._get_led_number(device)
+            
+            # Xác định state
+            state = '1' if action == 'on' else '0'
+            
+            url = f"http://{device.ip_address}/led{led_number}?state={state}"
+            self.stdout.write(f'   🔗 LED URL: {url}')
+            
+            response = requests.get(url, timeout=5)
+            success = response.status_code == 200
+            
+            self.stdout.write(
+                self.style.SUCCESS(f'   ✅ LED response: {response.status_code}')
+                if success else
+                self.style.ERROR(f'   ❌ LED failed: {response.status_code}')
+            )
+            
+            return success
+            
+        except requests.exceptions.Timeout:
+            self.stdout.write(self.style.ERROR('   ❌ LED timeout'))
+            return False
+        except Exception as e:
+            self.stdout.write(self.style.ERROR(f'   ❌ LED error: {e}'))
+            return False
+    
+    def _control_fan(self, device, action):
+        """Điều khiển quạt"""
+        try:
+            speed = '3' if action == 'on' else '0'
+            
+            url = f"http://{device.ip_address}/fan?speed={speed}"
+            self.stdout.write(f'   🔗 FAN URL: {url}')
+            
+            response = requests.get(url, timeout=5)
+            success = response.status_code == 200
+            
+            self.stdout.write(
+                self.style.SUCCESS(f'   ✅ FAN response: {response.status_code}')
+                if success else
+                self.style.ERROR(f'   ❌ FAN failed: {response.status_code}')
+            )
+            
+            return success
+            
+        except Exception as e:
+            self.stdout.write(self.style.ERROR(f'   ❌ FAN error: {e}'))
+            return False
+    
+    def _control_door(self, device, action):
+        """Điều khiển cửa"""
+        try:
+            door_action = 'open' if action == 'on' else 'close'
+            
+            url = f"http://{device.ip_address}/door?action={door_action}"
+            self.stdout.write(f'   🔗 DOOR URL: {url}')
+            
+            response = requests.get(url, timeout=5)
+            success = response.status_code == 200
+            
+            self.stdout.write(
+                self.style.SUCCESS(f'   ✅ DOOR response: {response.status_code}')
+                if success else
+                self.style.ERROR(f'   ❌ DOOR failed: {response.status_code}')
+            )
+            
+            return success
+            
+        except Exception as e:
+            self.stdout.write(self.style.ERROR(f'   ❌ DOOR error: {e}'))
+            return False
+    
+    def _control_dryer(self, device, action):
+        """Điều khiển máy sấy"""
+        try:
+            dryer_action = 'out' if action == 'on' else 'in'
+            
+            url = f"http://{device.ip_address}/dry?action={dryer_action}"
+            self.stdout.write(f'   🔗 DRYER URL: {url}')
+            
+            response = requests.get(url, timeout=5)
+            success = response.status_code == 200
+            
+            self.stdout.write(
+                self.style.SUCCESS(f'   ✅ DRYER response: {response.status_code}')
+                if success else
+                self.style.ERROR(f'   ❌ DRYER failed: {response.status_code}')
+            )
+            
+            return success
+            
+        except Exception as e:
+            self.stdout.write(self.style.ERROR(f'   ❌ DRYER error: {e}'))
+            return False
+    
+    def _get_led_number(self, device):
+        """Xác định LED number từ device name"""
+        name = device.name.lower()
+        if '2' in name or 'ngủ' in name or 'ngu' in name:
+            return '2'
+        return '1'
     
     def send_realtime_update(self, device):
         """Gửi realtime update qua WebSocket"""
@@ -223,8 +361,8 @@ class Command(BaseCommand):
                         }
                     }
                 )
-                self.stdout.write('📡 Đã gửi realtime update')
+                self.stdout.write('   📡 Đã gửi realtime update')
         except Exception as e:
             self.stdout.write(
-                self.style.WARNING(f'⚠️ Không gửi được realtime update: {e}')
+                self.style.WARNING(f'   ⚠️ Không gửi được realtime update: {e}')
             )

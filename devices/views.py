@@ -4,6 +4,7 @@ from django.views.decorators.http import require_http_methods
 from django.utils.decorators import method_decorator
 from django.views import View
 import json
+import requests
 from django.db.models import Sum, Avg, Count
 from django.utils import timezone
 from datetime import timedelta, datetime
@@ -156,38 +157,57 @@ class DeviceControlView(View):
         
         try:
             data = json.loads(request.body)
-            action = data.get('action')  # 'toggle', 'on', 'off'
+            action = data.get('action')  # 'turn_on', 'turn_off', 'open', 'close' từ Flutter
+            
+            # CONVERT action từ Flutter sang format Django
+            action_mapping = {
+                'turn_on': 'on',
+                'turn_off': 'off',
+                'open': 'on',
+                'close': 'off'
+            }
+            
+            # Chuyển đổi action nếu cần
+            django_action = action_mapping.get(action, action)
             
             device = Device.objects.get(id=device_id)
-            old_status = device.status.copy()
+            old_status = device.status.copy() if device.status else {}
             old_is_on = device.is_on
             
+            # GỬI LỆNH ĐẾN ESP8266
+            esp_success = self._send_to_esp8266(device, django_action, data)
+            if not esp_success:
+                return JsonResponse({
+                    'success': False, 
+                    'message': 'Không thể kết nối với thiết bị'
+                }, status=500)
+            
             # Cập nhật thống kê TRƯỚC KHI thay đổi trạng thái
-            _update_device_statistics(device, action, old_is_on)
+            self._update_device_statistics(device, django_action, old_is_on)
             
             # Cập nhật trạng thái thiết bị
-            if action == 'toggle':
+            if django_action == 'toggle':
                 device.is_on = not device.is_on
-            elif action == 'on':
+            elif django_action == 'on':
                 device.is_on = True
-            elif action == 'off':
+            elif django_action == 'off':
                 device.is_on = False
             
             # Cập nhật status dựa trên device type
             if device.device_type == 'light':
                 device.status = {
-                    'brightness': data.get('brightness', device.status.get('brightness', 100)),
-                    'color': data.get('color', device.status.get('color', '#ffffff'))
+                    'brightness': data.get('brightness', device.status.get('brightness', 100) if device.status else 100),
+                    'color': data.get('color', device.status.get('color', '#ffffff') if device.status else '#ffffff')
                 }
             elif device.device_type == 'fan':
                 device.status = {
-                    'speed': data.get('speed', device.status.get('speed', 3)),
-                    'mode': data.get('mode', device.status.get('mode', 'normal'))
+                    'speed': data.get('speed', device.status.get('speed', 3) if device.status else 3),
+                    'mode': data.get('mode', device.status.get('mode', 'normal') if device.status else 'normal')
                 }
             elif device.device_type == 'ac':
                 device.status = {
-                    'temperature': data.get('temperature', device.status.get('temperature', 25)),
-                    'mode': data.get('mode', device.status.get('mode', 'cool'))
+                    'temperature': data.get('temperature', device.status.get('temperature', 25) if device.status else 25),
+                    'mode': data.get('mode', device.status.get('mode', 'cool') if device.status else 'cool')
                 }
             
             device.save()
@@ -195,7 +215,7 @@ class DeviceControlView(View):
             # Ghi log
             DeviceLog.objects.create(
                 device=device,
-                action=action,
+                action=action,  # Giữ nguyên action từ Flutter để dễ debug
                 old_status={'is_on': old_is_on, **old_status},
                 new_status={'is_on': device.is_on, **device.status},
                 user=request.user
@@ -203,7 +223,7 @@ class DeviceControlView(View):
             
             return JsonResponse({
                 'success': True,
-                'message': f'Đã { "bật" if device.is_on else "tắt" } {device.name}',
+                'message': f'Đã {"bật" if device.is_on else "tắt"} {device.name}',
                 'device': {
                     'id': str(device.id),
                     'name': device.name,
@@ -215,7 +235,274 @@ class DeviceControlView(View):
         except Device.DoesNotExist:
             return JsonResponse({'success': False, 'message': 'Thiết bị không tồn tại'}, status=404)
         except Exception as e:
+            print(f"❌ Error in DeviceControlView: {e}")
+            import traceback
+            traceback.print_exc()
             return JsonResponse({'success': False, 'message': f'Lỗi: {str(e)}'}, status=400)
+    
+    def _send_to_esp8266(self, device, action, data):
+        """Gửi lệnh đến ESP8266"""
+        try:
+            # Kiểm tra IP address
+            if not device.ip_address:
+                print(f"⚠️ Device {device.name} không có IP address")
+                return False
+            
+            print(f"📡 Sending to ESP8266: {device.ip_address}, action: {action}")
+            
+            # Mapping device types với ESP endpoints
+            endpoints = {
+                'light': self._control_light,
+                'led': self._control_light,  # Thêm alias 'led'
+                'fan': self._control_fan,
+                'door': self._control_door,
+                'ac': self._control_dryer,
+            }
+            
+            control_func = endpoints.get(device.device_type.lower())
+            if control_func:
+                result = control_func(device, action, data)
+                print(f"{'✅' if result else '❌'} ESP8266 response: {result}")
+                return result
+            else:
+                print(f"⚠️ Device type {device.device_type} chưa được hỗ trợ")
+                return True  # Vẫn trả về success cho các device type khác
+            
+        except Exception as e:
+            print(f"❌ Lỗi gửi lệnh ESP8266: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def _control_light(self, device, action, data):
+        """Điều khiển đèn"""
+        import requests
+        
+        # Xác định LED number dựa trên device name hoặc ID
+        led_number = self._get_led_number(device)
+        
+        # Xác định state (1=on, 0=off)
+        if action == 'toggle':
+            state = '0' if device.is_on else '1'
+        elif action == 'on':
+            state = '1'
+        elif action == 'off':
+            state = '0'
+        else:
+            state = '1'  # Default
+        
+        url = f"http://{device.ip_address}/led{led_number}?state={state}"
+        print(f"🔗 LED URL: {url}")
+        
+        try:
+            response = requests.get(url, timeout=5)
+            return response.status_code == 200
+        except Exception as e:
+            print(f"❌ LED control error: {e}")
+            return False
+    
+    def _control_fan(self, device, action, data):
+        """Điều khiển quạt"""
+        import requests
+        
+        if action == 'toggle':
+            speed = '0' if device.is_on else '3'  # Tắt hoặc tốc độ 3
+        elif action == 'on':
+            speed = str(data.get('speed', 3))  # Mặc định tốc độ 3
+        elif action == 'off':
+            speed = '0'
+        else:
+            speed = '3'  # Default
+        
+        url = f"http://{device.ip_address}/fan?speed={speed}"
+        print(f"🔗 FAN URL: {url}")
+        
+        try:
+            response = requests.get(url, timeout=5)
+            return response.status_code == 200
+        except Exception as e:
+            print(f"❌ FAN control error: {e}")
+            return False
+    
+    def _control_door(self, device, action, data):
+        """Điều khiển cửa"""
+        import requests
+        
+        if action == 'toggle':
+            door_action = 'close' if device.is_on else 'open'
+        elif action == 'on':
+            door_action = 'open'
+        elif action == 'off':
+            door_action = 'close'
+        else:
+            door_action = 'open'  # Default
+        
+        url = f"http://{device.ip_address}/door?action={door_action}"
+        print(f"🔗 DOOR URL: {url}")
+        
+        try:
+            response = requests.get(url, timeout=5)
+            return response.status_code == 200
+        except Exception as e:
+            print(f"❌ DOOR control error: {e}")
+            return False
+    
+    def _control_dryer(self, device, action, data):
+        """Điều khiển máy sấy"""
+        import requests
+        
+        if action == 'toggle':
+            dryer_action = 'in' if device.is_on else 'out'
+        elif action == 'on':
+            dryer_action = 'out'
+        elif action == 'off':
+            dryer_action = 'in'
+        else:
+            dryer_action = 'out'  # Default
+        
+        url = f"http://{device.ip_address}/dry?action={dryer_action}"
+        print(f"🔗 DRYER URL: {url}")
+        
+        try:
+            response = requests.get(url, timeout=5)
+            return response.status_code == 200
+        except Exception as e:
+            print(f"❌ DRYER control error: {e}")
+            return False
+    
+    def _get_led_number(self, device):
+        """Xác định LED number từ device name"""
+        name = device.name.lower()
+        if '2' in name or 'ngủ' in name or 'ngu' in name:
+            return '2'
+        else:
+            return '1'  # Mặc định LED1
+    
+    def _update_device_statistics(self, device, action, old_is_on):
+        """Cập nhật thống kê sử dụng"""
+        from django.utils import timezone
+        
+        today = timezone.now().date()
+        
+        # Tạo hoặc cập nhật DeviceStatistics
+        stats, created = DeviceStatistics.objects.get_or_create(
+            device=device,
+            date=today,
+            defaults={
+                'turn_on_count': 0,
+                'total_usage_minutes': 0,
+                'power_consumption': 0.0,
+                'cost': 0.0
+            }
+        )
+        
+        # Tăng số lần bật nếu chuyển từ off sang on
+        if action in ['on', 'toggle'] and not old_is_on:
+            stats.turn_on_count += 1
+            stats.save()
+            
+            # Tạo session sử dụng mới
+            DeviceUsageSession.objects.create(
+                device=device,
+                start_time=timezone.now()
+            )
+        
+        # Kết thúc session nếu chuyển từ on sang off
+        elif action in ['off', 'toggle'] and old_is_on:
+            # Tìm session chưa kết thúc
+            active_session = DeviceUsageSession.objects.filter(
+                device=device,
+                end_time__isnull=True
+            ).last()
+            
+            if active_session:
+                active_session.end_time = timezone.now()
+                duration = (active_session.end_time - active_session.start_time).total_seconds() / 60
+                active_session.duration_minutes = int(duration)
+                active_session.save()
+                
+                # Cập nhật tổng thời gian sử dụng
+                stats.total_usage_minutes += active_session.duration_minutes
+                
+                # Tính điện năng tiêu thụ
+                power_rates = {
+                    'light': 0.01,
+                    'led': 0.01,
+                    'fan': 0.05,
+                    'ac': 0.8,
+                    'socket': 0.02,
+                    'door': 0.005,
+                    'dryer': 0.1
+                }
+                
+                power_rate = power_rates.get(device.device_type.lower(), 0.01)
+                hours_used = active_session.duration_minutes / 60
+                stats.power_consumption += power_rate * hours_used
+                stats.cost += stats.power_consumption * 3000  # 3000đ/kWh
+                
+                stats.save()
+
+# devices/views.py
+@method_decorator(csrf_exempt, name='dispatch')
+class SensorDataView(View):
+    def get(self, request):
+        """Lấy dữ liệu sensor từ ESP8266"""
+        try:
+            # Tìm device có sensor data (giả sử device type là 'sensor')
+            sensor_device = Device.objects.filter(device_type='sensor').first()
+            
+            if not sensor_device or not sensor_device.ip_address:
+                return JsonResponse({
+                    'success': False,
+                    'message': 'Không tìm thấy sensor device'
+                })
+            
+            # Gọi ESP8266 để lấy sensor data
+            url = f"http://{sensor_device.ip_address}/sensor"
+            response = requests.get(url, timeout=5)
+            
+            if response.status_code == 200:
+                # Parse sensor data từ ESP8266
+                sensor_data = self._parse_sensor_data(response.text)
+                
+                # Cập nhật status cho sensor device
+                sensor_device.status = sensor_data
+                sensor_device.save()
+                
+                return JsonResponse({
+                    'success': True,
+                    'sensor_data': sensor_data
+                })
+            else:
+                return JsonResponse({
+                    'success': False,
+                    'message': 'Không thể lấy dữ liệu từ sensor'
+                })
+                
+        except Exception as e:
+            return JsonResponse({
+                'success': False,
+                'message': f'Lỗi: {str(e)}'
+            })
+    
+    def _parse_sensor_data(self, raw_data):
+        """Parse sensor data từ ESP8266"""
+        # Giả sử raw_data có format: "temperature:25.5,humidity:60.2"
+        try:
+            data = {}
+            pairs = raw_data.strip().split(',')
+            for pair in pairs:
+                if ':' in pair:
+                    key, value = pair.split(':', 1)
+                    data[key.strip().lower()] = float(value.strip())
+            
+            return {
+                'temperature': data.get('temperature', 0),
+                'humidity': data.get('humidity', 0)
+            }
+        except:
+            return {'temperature': 0, 'humidity': 0}
+        
 
 @method_decorator(csrf_exempt, name='dispatch')
 class DeviceLogsView(View):
