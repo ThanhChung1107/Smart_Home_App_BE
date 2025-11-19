@@ -14,4 +14,5 @@ urlpatterns = [
     path('api/schedules/', views.ScheduleListView.as_view(), name='schedule_list_create'),
     path('api/schedules/<uuid:schedule_id>/', views.ScheduleDetailView.as_view(), name='schedule_detail_update_delete'),
     path('api/sensor-data/', views.SensorDataView.as_view(), name='sensor_data'), 
+    path('api/devices/sync/', views.DeviceSyncView.as_view(), name='device_sync'),
 ]

@@ -442,6 +442,220 @@ class DeviceControlView(View):
                 
                 stats.save()
 
+# # devices/views.py - THÊM VIEW MỚI
+
+# @method_decorator(csrf_exempt, name='dispatch')
+# class SyncDeviceStatusView(View):
+#     """API để sync trạng thái thiết bị từ ESP8266 theo yêu cầu"""
+    
+#     def post(self, request):
+#         if not request.user.is_authenticated:
+#             return JsonResponse({
+#                 'success': False, 
+#                 'message': 'Chưa đăng nhập'
+#             }, status=401)
+        
+#         try:
+#             data = json.loads(request.body) if request.body else {}
+#             device_id = data.get('device_id')  # Optional: sync specific device
+            
+#             if device_id:
+#                 # Sync 1 device cụ thể
+#                 device = Device.objects.get(id=device_id)
+#                 success = self._sync_single_device(device)
+                
+#                 if success:
+#                     return JsonResponse({
+#                         'success': True,
+#                         'message': f'Đã đồng bộ {device.name}',
+#                         'device': {
+#                             'id': str(device.id),
+#                             'name': device.name,
+#                             'is_on': device.is_on,
+#                             'status': device.status
+#                         }
+#                     })
+#                 else:
+#                     return JsonResponse({
+#                         'success': False,
+#                         'message': 'Không thể kết nối với thiết bị'
+#                     })
+#             else:
+#                 # Sync tất cả devices
+#                 synced_devices = self._sync_all_devices()
+                
+#                 return JsonResponse({
+#                     'success': True,
+#                     'message': f'Đã đồng bộ {synced_devices} thiết bị',
+#                     'synced_count': synced_devices
+#                 })
+                
+#         except Device.DoesNotExist:
+#             return JsonResponse({
+#                 'success': False,
+#                 'message': 'Thiết bị không tồn tại'
+#             }, status=404)
+#         except Exception as e:
+#             return JsonResponse({
+#                 'success': False,
+#                 'message': f'Lỗi: {str(e)}'
+#             }, status=400)
+    
+#     def _sync_single_device(self, device):
+#         """Đồng bộ 1 device"""
+#         if not device.ip_address:
+#             return False
+        
+#         try:
+#             url = f"http://{device.ip_address}/api/status"
+#             response = requests.get(url, timeout=3)
+            
+#             if response.status_code == 200:
+#                 esp_status = response.json()
+#                 return self._update_device_from_esp(device, esp_status)
+            
+#             return False
+            
+#         except Exception as e:
+#             print(f"❌ Sync device {device.name} error: {e}")
+#             return False
+    
+#     def _sync_all_devices(self):
+#         """Đồng bộ tất cả devices"""
+#         devices = Device.objects.exclude(ip_address__isnull=True).exclude(ip_address='')
+        
+#         # Group by IP
+#         devices_by_ip = {}
+#         for device in devices:
+#             ip = device.ip_address
+#             if ip not in devices_by_ip:
+#                 devices_by_ip[ip] = []
+#             devices_by_ip[ip].append(device)
+        
+#         synced_count = 0
+        
+#         for ip, device_list in devices_by_ip.items():
+#             try:
+#                 url = f"http://{ip}/api/status"
+#                 response = requests.get(url, timeout=3)
+                
+#                 if response.status_code == 200:
+#                     esp_status = response.json()
+                    
+#                     for device in device_list:
+#                         if self._update_device_from_esp(device, esp_status):
+#                             synced_count += 1
+                            
+#             except Exception as e:
+#                 print(f"❌ Sync ESP {ip} error: {e}")
+#                 continue
+        
+#         return synced_count
+    
+#     def _update_device_from_esp(self, device, esp_status):
+#         """Cập nhật device từ ESP status"""
+#         old_is_on = device.is_on
+#         new_is_on = None
+        
+#         device_type = device.device_type.lower()
+        
+#         # Parse status dựa trên device type
+#         if device_type in ['light', 'led']:
+#             led_num = self._get_led_number(device)
+#             key = f"LED{led_num}"
+#             if key in esp_status:
+#                 new_is_on = bool(esp_status[key])
+        
+#         elif device_type == 'fan':
+#             if 'FAN' in esp_status:
+#                 new_is_on = esp_status['FAN'] > 0
+        
+#         elif device_type == 'door':
+#             if 'DOOR' in esp_status:
+#                 new_is_on = bool(esp_status['DOOR'])
+        
+#         elif device_type in ['dryer', 'dry', 'ac']:
+#             if 'DRY' in esp_status:
+#                 new_is_on = esp_status['DRY'] > 0
+        
+#         # Không có thay đổi
+#         if new_is_on is None or new_is_on == old_is_on:
+#             return False
+        
+#         # Cập nhật device
+#         device.is_on = new_is_on
+        
+#         # Cập nhật sensor data
+#         if not device.status:
+#             device.status = {}
+        
+#         if 'TEMP' in esp_status:
+#             device.status['temperature'] = esp_status['TEMP']
+#         if 'HUM' in esp_status:
+#             device.status['humidity'] = esp_status['HUM']
+#         if 'AUTO' in esp_status:
+#             device.status['auto_mode'] = esp_status['AUTO']
+        
+#         device.save()
+        
+#         # Ghi log
+#         DeviceLog.objects.create(
+#             device=device,
+#             action='manual_sync',
+#             old_status={'is_on': old_is_on},
+#             new_status={'is_on': new_is_on},
+#             user=None
+#         )
+        
+#         print(f"🔄 Synced {device.name}: {old_is_on} → {new_is_on}")
+        
+#         return True
+    
+#     def _get_led_number(self, device):
+#         """Xác định LED number"""
+#         name = device.name.lower()
+#         if '2' in name or 'ngủ' in name or 'ngu' in name:
+#             return '2'
+#         return '1'
+
+# # devices/views.py
+@method_decorator(csrf_exempt, name='dispatch')
+class DeviceSyncView(View):
+    def post(self, request):
+        """API để Flutter app trigger sync manual"""
+        try:
+            data = json.loads(request.body)
+            device_id = data.get('device_id')
+            
+            # Gọi sync service
+            from .management.commands.sync_device_status import Command
+            
+            sync_command = Command()
+            
+            if device_id:
+                # Sync 1 device cụ thể
+                device = Device.objects.get(id=device_id)
+                devices = [device]
+                esp_ip = device.ip_address or "192.168.1.8"
+                sync_command.sync_esp8266(esp_ip, devices)
+            else:
+                # Sync tất cả devices
+                sync_command.sync_all_devices()
+            
+            # Đếm số devices đã sync
+            synced_count = Device.objects.filter(is_on=True).count()
+            
+            return JsonResponse({
+                'success': True,
+                'message': 'Đã đồng bộ trạng thái thiết bị',
+                'synced_count': synced_count
+            })
+            
+        except Exception as e:
+            return JsonResponse({
+                'success': False,
+                'message': f'Lỗi đồng bộ: {str(e)}'
+            }, status=400)
 # devices/views.py
 @method_decorator(csrf_exempt, name='dispatch')
 class SensorDataView(View):
