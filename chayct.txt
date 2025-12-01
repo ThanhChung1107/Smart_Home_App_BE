@@ -1,0 +1,8 @@
+python manage.py runserver 0.0.0.0:8000
+
+cd D:\HK1-2025-2026\PBL4\smart_home
+
+python manage.py sync_device_status --interval=5
+
+python manage.py start_scheduler --interval=30
+
